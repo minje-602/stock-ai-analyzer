@@ -8,12 +8,19 @@ import re
 import time
 import json
 
-with open(".env") as f:
-    for line in f:
-        key, val = line.strip().split("=")
-        os.environ[key] = val
+# 로컬(.env)과 Streamlit Cloud(secrets) 양쪽 지원
+try:
+    # Streamlit Cloud: secrets에서 읽기
+    api_key = st.secrets["GROQ_API_KEY"]
+except:
+    # 로컬: .env에서 읽기
+    with open(".env") as f:
+        for line in f:
+            key, val = line.strip().split("=")
+            os.environ[key] = val
+    api_key = os.environ["GROQ_API_KEY"]
 
-client = Groq(api_key=os.environ["GROQ_API_KEY"])
+client = Groq(api_key=api_key)
 
 st.set_page_config(page_title="주식 AI 분석기", page_icon="📈", layout="wide")
 st.title("📈 주식 AI 분석기")
