@@ -2,6 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from groq import Groq
 import os
 import re
@@ -10,10 +11,8 @@ import json
 
 # 로컬(.env)과 Streamlit Cloud(secrets) 양쪽 지원
 try:
-    # Streamlit Cloud: secrets에서 읽기
     api_key = st.secrets["GROQ_API_KEY"]
 except:
-    # 로컬: .env에서 읽기
     with open(".env") as f:
         for line in f:
             key, val = line.strip().split("=")
@@ -72,8 +71,7 @@ OVERSEAS_MAP = {
     "아마존": "AMZN", "amazon": "AMZN",
     "메타": "META", "meta": "META", "페이스북": "META",
     "tsmc": "TSM",
-    "넷플릭스": "NFLX", "netflix": "NFLX",
-    "삼성전자adr": "SSNLF"
+    "넷플릭스": "NFLX", "netflix": "NFLX"
 }
 
 def fetch_data(ticker, period, interval):
@@ -106,9 +104,9 @@ def ask_agent(messages, max_retry=3, temperature=0):
                 time.sleep(20)
             else:
                 if attempt == max_retry - 1:
-                    return "AI 응답 오류가 발생했습니다."
+                    return "⚠️ AI 응답 한도를 초과했습니다. 1분 후 다시 시도해주세요."
                 time.sleep(2)
-    return "AI 응답에 실패했습니다."
+    return "⚠️ AI 응답에 실패했습니다. 잠시 후 다시 시도해주세요."
 
 def extract_tickers_with_llm(question, krx_dict):
     """LLM으로 질문에서 종목명 추출 → KRX/해외맵에서 코드 찾기"""
@@ -119,7 +117,6 @@ def extract_tickers_with_llm(question, krx_dict):
 - "sk hynix" → "SK하이닉스"
 - "하이닉스" → "SK하이닉스"
 - "apple이랑 테슬라" → "애플", "테슬라"
-- "엔솔" → "LG에너지솔루션"
 
 규칙:
 1. 한국 종목은 반드시 한글 정식명으로
@@ -142,7 +139,6 @@ def extract_tickers_with_llm(question, krx_dict):
             ]
         )
         content = response.choices[0].message.content
-        # JSON 부분만 추출
         match = re.search(r'\{.*\}', content, re.DOTALL)
         if match:
             data = json.loads(match.group())
@@ -150,19 +146,15 @@ def extract_tickers_with_llm(question, krx_dict):
         else:
             return []
 
-        # 추출된 종목명을 실제 코드로 변환
         results = []
         for name in extracted:
             name_lower = name.lower().strip()
-            # 해외 먼저
             if name_lower in OVERSEAS_MAP:
                 results.append((name, OVERSEAS_MAP[name_lower]))
                 continue
-            # KRX에서 찾기 (정확 매칭)
             if name in krx_dict:
                 results.append((name, krx_dict[name]))
                 continue
-            # KRX에서 찾기 (부분 매칭)
             for krx_name, code in krx_dict.items():
                 if name in krx_name or krx_name in name:
                     results.append((krx_name, code))
@@ -184,7 +176,8 @@ defaults = {
     "rsi_val": 0,
     "chart_fig": None,
     "metrics": {},
-    "search_input": ""
+    "search_input": "",
+    "market_state": ""
 }
 for key, val in defaults.items():
     if key not in st.session_state:
@@ -223,8 +216,21 @@ if st.session_state.search_results:
         st.session_state.search_results = {}
         st.rerun()
 
+# 종목 코드 직접 입력 (검색 실패 대비)
+with st.sidebar.expander("종목 코드 직접 입력"):
+    manual_code = st.text_input("코드 입력", placeholder="예: 005930.KS, AAPL")
+    if st.button("이 코드로 설정"):
+        if manual_code.strip():
+            st.session_state.ticker = manual_code.strip()
+            st.session_state.search_input = manual_code.strip()
+            st.session_state.messages = []
+            st.session_state.analyst_report = ""
+            st.session_state.analysis_done = False
+            st.rerun()
+
 st.sidebar.markdown(f"**선택된 종목:** `{st.session_state.ticker}`")
 period_label = st.sidebar.selectbox("기간", list(PERIOD_MAP.keys()), index=4)
+st.sidebar.caption("⏱️ AI 분석은 보통 5~15초 걸립니다")
 
 if st.sidebar.button("분석 시작"):
     ticker = st.session_state.ticker
@@ -234,7 +240,7 @@ if st.sidebar.button("분석 시작"):
         df, df_realtime = fetch_data(ticker, period, interval)
 
     if df.empty:
-        st.error("종목 데이터를 불러올 수 없습니다.")
+        st.error("종목 데이터를 불러올 수 없습니다. 종목 코드나 기간을 확인해주세요.")
     else:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -247,22 +253,47 @@ if st.sidebar.button("분석 시작"):
             ma20_window = min(20, len(df) // 2)
             rsi_window = min(14, len(df) // 2)
 
+            # 이동평균
             df["MA5"] = df["Close"].rolling(ma5_window).mean()
             df["MA20"] = df["Close"].rolling(ma20_window).mean()
 
+            # RSI
             delta = df["Close"].diff()
             gain = delta.clip(lower=0).rolling(rsi_window).mean()
             loss = -delta.clip(upper=0).rolling(rsi_window).mean()
             rs = gain / loss
             df["RSI"] = 100 - (100 / (1 + rs))
 
+            # 볼린저 밴드 (20구간 기준)
+            bb_window = min(20, len(df) // 2)
+            df["BB_MID"] = df["Close"].rolling(bb_window).mean()
+            bb_std = df["Close"].rolling(bb_window).std()
+            df["BB_UPPER"] = df["BB_MID"] + 2 * bb_std
+            df["BB_LOWER"] = df["BB_MID"] - 2 * bb_std
+
+            # MACD (12, 26, 9)
+            ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+            ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+            df["MACD"] = ema12 - ema26
+            df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
+            df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
+
+            # 실시간 데이터 + 장 상태 판단
             latest_close = None
+            market_state = "장 마감 (전일 종가 기준)"
             if not df_realtime.empty:
                 if isinstance(df_realtime.columns, pd.MultiIndex):
                     df_realtime.columns = df_realtime.columns.get_level_values(0)
                 df_realtime = df_realtime.dropna()
                 if not df_realtime.empty:
                     latest_close = float(df_realtime["Close"].iloc[-1])
+                    last_time = df_realtime.index[-1]
+                    now = pd.Timestamp.now(tz=last_time.tz) if last_time.tz else pd.Timestamp.now()
+                    diff_min = (now - last_time).total_seconds() / 60
+                    if diff_min < 30:
+                        market_state = "실시간 (장중)"
+                    else:
+                        market_state = "장 마감 (최근 거래 기준)"
 
             current = latest_close if latest_close else float(df["Close"].iloc[-1])
             prev = float(df["Close"].iloc[-2])
@@ -271,16 +302,52 @@ if st.sidebar.button("분석 시작"):
             rsi_val = float(df["RSI"].iloc[-1]) if not pd.isna(df["RSI"].iloc[-1]) else 50.0
             ma5_val = float(df["MA5"].iloc[-1]) if not pd.isna(df["MA5"].iloc[-1]) else current
             ma20_val = float(df["MA20"].iloc[-1]) if not pd.isna(df["MA20"].iloc[-1]) else current
+            macd_val = float(df["MACD"].iloc[-1]) if not pd.isna(df["MACD"].iloc[-1]) else 0
+            macd_sig = float(df["MACD_SIGNAL"].iloc[-1]) if not pd.isna(df["MACD_SIGNAL"].iloc[-1]) else 0
+            bb_upper = float(df["BB_UPPER"].iloc[-1]) if not pd.isna(df["BB_UPPER"].iloc[-1]) else current
+            bb_lower = float(df["BB_LOWER"].iloc[-1]) if not pd.isna(df["BB_LOWER"].iloc[-1]) else current
 
-            fig = go.Figure()
+            # 3단 차트 (가격 / 거래량 / MACD)
+            fig = make_subplots(
+                rows=3, cols=1, shared_xaxes=True,
+                row_heights=[0.5, 0.25, 0.25],
+                vertical_spacing=0.12,
+                subplot_titles=("가격 + 이동평균 + 볼린저밴드", "거래량", "MACD (추세 전환 신호)")
+            )
+
+            # ① 가격 + 캔들 + 이동평균 + 볼린저밴드
             fig.add_trace(go.Candlestick(
                 x=df.index, open=df["Open"], high=df["High"],
                 low=df["Low"], close=df["Close"], name="캔들",
                 increasing_line_color="red", decreasing_line_color="blue"
-            ))
-            fig.add_trace(go.Scatter(x=df.index, y=df["MA5"], name=f"MA{ma5_window}", line=dict(color="orange")))
-            fig.add_trace(go.Scatter(x=df.index, y=df["MA20"], name=f"MA{ma20_window}", line=dict(color="purple")))
-            fig.update_layout(title=f"{ticker} 주가 차트 ({period_label})", xaxis_rangeslider_visible=False)
+            ), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df["MA5"], name=f"MA{ma5_window}", line=dict(color="orange", width=1)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df["MA20"], name=f"MA{ma20_window}", line=dict(color="purple", width=1)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df["BB_UPPER"], name="BB 상단", line=dict(color="gray", width=1, dash="dot")), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df["BB_LOWER"], name="BB 하단", line=dict(color="gray", width=1, dash="dot"), fill="tonexty", fillcolor="rgba(128,128,128,0.1)"), row=1, col=1)
+
+            # ② 거래량
+            colors = ["red" if df["Close"].iloc[i] >= df["Open"].iloc[i] else "blue" for i in range(len(df))]
+            fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="거래량", marker_color=colors), row=2, col=1)
+
+            # ③ MACD
+            fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD", line=dict(color="blue", width=1)), row=3, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df["MACD_SIGNAL"], name="Signal", line=dict(color="orange", width=1)), row=3, col=1)
+            hist_colors = ["red" if v >= 0 else "blue" for v in df["MACD_HIST"]]
+            fig.add_trace(go.Bar(x=df.index, y=df["MACD_HIST"], name="Histogram", marker_color=hist_colors), row=3, col=1)
+
+            fig.update_layout(
+                title=dict(text=f"{ticker} 종합 차트 ({period_label})", y=0.98, x=0.5, xanchor="center"),
+                xaxis_rangeslider_visible=False,
+                height=1000,
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="center", x=0.5),
+                margin=dict(t=120)
+            )
+
+            # 서브플롯 제목 글씨 크기 조정
+            for ann in fig['layout']['annotations']:
+                ann['font'] = dict(size=14)
 
             analyst_prompt = f"""종목: {ticker}
 기간: {period_label}
@@ -289,16 +356,19 @@ if st.sidebar.button("분석 시작"):
 {ma5_window}구간 이동평균: {ma5_val:,.0f}원
 {ma20_window}구간 이동평균: {ma20_val:,.0f}원
 RSI: {rsi_val:.1f}
+MACD: {macd_val:.2f}, Signal: {macd_sig:.2f}
+볼린저밴드 상단: {bb_upper:,.0f}원, 하단: {bb_lower:,.0f}원
 
 위 데이터를 바탕으로 현재 주가 상태를 분석해줘.
 - RSI 과매수/과매도 여부
-- 골든크로스/데드크로스 여부
-- 추세 분석
-- 투자 시 주의점
+- 이동평균 골든크로스/데드크로스 여부
+- MACD 신호 (MACD가 Signal보다 위면 상승신호, 아래면 하락신호)
+- 볼린저밴드 위치 (현재가가 상단 근처면 과열, 하단 근처면 침체)
+- 종합 추세
 
-초보자도 이해할 수 있게 3~4문단으로 작성해. 마지막에 이 분석은 참고용임을 명시해."""
+초보자도 이해할 수 있게 4~5문단으로 작성해. 마지막에 이 분석은 참고용임을 명시해."""
 
-            with st.spinner("AI 분석 중..."):
+            with st.spinner("AI가 5개 지표를 종합 분석 중입니다... (5~15초)"):
                 report = ask_agent([
                     {"role": "system", "content": "당신은 주식 분석 전문가입니다. 반드시 한국어로만 답변합니다. 한자, 중국어, 일본어는 절대 사용하지 마세요."},
                     {"role": "user", "content": analyst_prompt}
@@ -309,10 +379,12 @@ RSI: {rsi_val:.1f}
             st.session_state.chart_fig = fig
             st.session_state.current = current
             st.session_state.rsi_val = rsi_val
+            st.session_state.market_state = market_state
             st.session_state.metrics = {
                 "current": current, "change": change,
                 "ma5": ma5_val, "ma20": ma20_val, "rsi": rsi_val,
                 "ma5_window": ma5_window, "ma20_window": ma20_window,
+                "macd": macd_val, "macd_sig": macd_sig,
                 "period_label": period_label
             }
             st.session_state.messages = []
@@ -320,16 +392,44 @@ RSI: {rsi_val:.1f}
 # 분석 결과 표시
 if st.session_state.analysis_done:
     m = st.session_state.metrics
-    col1, col2, col3, col4 = st.columns(4)
+
+    # 장 상태 안내
+    if "장중" in st.session_state.market_state:
+        st.success(f"🟢 {st.session_state.market_state}")
+    else:
+        st.info(f"🔵 {st.session_state.market_state}")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("현재가", f"{m['current']:,.0f}")
     col2.metric("등락률", f"{m['change']:+.2f}%")
     col3.metric(f"{m['ma5_window']}구간 이평", f"{m['ma5']:,.0f}")
     col4.metric("RSI", f"{m['rsi']:.1f}")
+    macd_signal_text = "상승" if m['macd'] > m['macd_sig'] else "하락"
+    col5.metric("MACD 신호", macd_signal_text)
 
     st.plotly_chart(st.session_state.chart_fig, use_container_width=True)
 
     st.subheader("🤖 AI 분석")
     st.write(st.session_state.analyst_report)
+
+    # 분석 결과 다운로드
+    download_text = f"""[주식 AI 분석 리포트]
+종목: {st.session_state.ticker}
+기간: {m['period_label']}
+현재가: {m['current']:,.0f}원
+등락률: {m['change']:+.2f}%
+RSI: {m['rsi']:.1f}
+MACD: {m['macd']:.2f} / Signal: {m['macd_sig']:.2f}
+
+[AI 분석 내용]
+{st.session_state.analyst_report}
+"""
+    st.download_button(
+        label="📥 분석 결과 다운로드 (.txt)",
+        data=download_text.encode("utf-8"),
+        file_name=f"{st.session_state.ticker}_분석리포트.txt",
+        mime="text/plain"
+    )
 
     st.subheader("💬 AI에게 추가 질문하기")
     st.caption("이전 대화 내용을 기억하며, 다른 종목 비교 시 실시간 데이터를 가져옵니다")
@@ -341,14 +441,10 @@ if st.session_state.analysis_done:
     if question := st.chat_input("궁금한 점을 물어보세요"):
         st.session_state.messages.append({"role": "user", "content": question})
 
-        # 1차: LLM으로 질문에서 종목 추출
         with st.spinner("질문 분석 중..."):
             mentioned_tickers = extract_tickers_with_llm(question, krx_dict)
-
-        # 현재 분석 중인 종목은 제외
         mentioned_tickers = [(n, c) for n, c in mentioned_tickers if c != st.session_state.ticker]
 
-        # 2차: 추출된 종목의 실시간 데이터 가져오기
         extra_context = ""
         if mentioned_tickers:
             with st.spinner("비교 종목 데이터 조회 중..."):
@@ -367,7 +463,6 @@ if st.session_state.analysis_done:
                     except:
                         extra_context += f"\n- {name} ({code}): 데이터 조회 실패"
 
-        # 3차: 최종 답변 생성
         chat_messages = [
             {"role": "system", "content": f"""당신은 주식 분석 전문가입니다. 반드시 한국어로만 답변합니다. 한자, 중국어, 일본어는 절대 사용하지 마세요.
 
